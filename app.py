@@ -3,6 +3,10 @@ import gradio as gr
 import requests
 import inspect
 import pandas as pd
+import random 
+from agent import build_graph
+from langchain_core.messages import HumanMessage
+from agent import State
 
 # (Keep Constants as is)
 # --- Constants ---
@@ -11,13 +15,33 @@ DEFAULT_API_URL = "https://agents-course-unit4-scoring.hf.space"
 # --- Basic Agent Definition ---
 # ----- THIS IS WERE YOU CAN BUILD WHAT YOU WANT ------
 class BasicAgent:
+    """A langgraph agent."""
     def __init__(self):
+        self.state = {
+            "query": "",
+            "tool_call": {},
+            "tool_output": "",
+            "answer": ""
+        }
         print("BasicAgent initialized.")
+        self.graph = build_graph()
+
     def __call__(self, question: str) -> str:
         print(f"Agent received question (first 50 chars): {question[:50]}...")
-        fixed_answer = "This is a default answer."
-        print(f"Agent returning fixed answer: {fixed_answer}")
-        return fixed_answer
+        
+        # Update the state with the new query
+        self.state["query"] = question
+        self.state["tool_call"] = {}
+        self.state["tool_output"] = ""
+        self.state["answer"] = ""
+
+        # Run the graph with current state
+        updated_state = self.graph.invoke(self.state)
+
+        # Return the answer from the updated state
+        return updated_state.get("answer", "No answer found.")
+
+
 
 def run_and_submit_all( profile: gr.OAuthProfile | None):
     """
@@ -79,6 +103,7 @@ def run_and_submit_all( profile: gr.OAuthProfile | None):
         if not task_id or question_text is None:
             print(f"Skipping item with missing task_id or question: {item}")
             continue
+        
         try:
             submitted_answer = agent(question_text)
             answers_payload.append({"task_id": task_id, "submitted_answer": submitted_answer})
@@ -139,7 +164,6 @@ def run_and_submit_all( profile: gr.OAuthProfile | None):
         results_df = pd.DataFrame(results_log)
         return status_message, results_df
 
-
 # --- Build Gradio Interface using Blocks ---
 with gr.Blocks() as demo:
     gr.Markdown("# Basic Agent Evaluation Runner")
@@ -171,7 +195,10 @@ with gr.Blocks() as demo:
         outputs=[status_output, results_table]
     )
 
+
+
 if __name__ == "__main__":
+
     print("\n" + "-"*30 + " App Starting " + "-"*30)
     # Check for SPACE_HOST and SPACE_ID at startup for information
     space_host_startup = os.getenv("SPACE_HOST")
