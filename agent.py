@@ -1,6 +1,3 @@
-# Requirements:
-# pip install langchain-huggingface langchain-google-genai langchain-groq langgraph langchain-community python-dotenv
-
 import os
 import math
 from typing import TypedDict, Optional, List, Any
@@ -280,50 +277,3 @@ def run_agent(query: str) -> str:
         
     except Exception as e:
         return f"Error: {e}"
-
-def run_agent_with_history(query: str) -> tuple[str, List[Any]]:
-
-    """Run the agent and return both the answer and the full message history.
-    Args:
-        query: The query to run the agent with.
-    Returns:
-        A tuple containing the final answer and the full message history.
-    """
-    print("Running agent with history")
-    graph = build_graph()
-    
-    initial_state = {
-        "messages": [HumanMessage(content=query)]
-    }
-    
-    try:
-        final_state = graph.invoke(initial_state)
-        
-        # Extract the final answer
-        messages = final_state["messages"]
-        final_answer = "No answer generated"
-        
-        for message in reversed(messages):
-            if isinstance(message, AIMessage) and not (hasattr(message, 'tool_calls') and message.tool_calls):
-                final_answer = message.content
-                break
-        
-        return str(final_answer), messages
-        
-    except Exception as e:
-        return f"Error: {e}", []
-
-if __name__ == "__main__":
-    # Test with a GAIA-style question
-    test_queries = [
-        "What is the capital of France?",
-        "Who won the 2024 Nobel Peace Prize?",
-        "What is 2 + 2?"
-        
-    ]
-    
-    for query in test_queries:
-        print(f"\nQuery: {query}")
-        result = run_agent(query)
-        print(f"{result}")
-        print("-" * 50)
