@@ -11,19 +11,55 @@ from langchain_community.tools.arxiv.tool import ArxivQueryRun
 from langchain_community.utilities.arxiv import ArxivAPIWrapper
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_groq import ChatGroq
+from langchain_chroma import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import SecretStr
 from dotenv import load_dotenv
+import chromadb
+from chromadb.config import Settings
 
 load_dotenv()
 
 class AgentState(TypedDict):
     messages: List[Any]
 
-# Global LLM instance
+# Global instances
 _llm = None
+_vectorstore = None
+_embeddings = None
+
+def get_embeddings():
+    """Get or create embeddings instance."""
+    global _embeddings
+    if _embeddings is None:
+        _embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            model_kwargs={'device': 'cpu'}
+        )
+    return _embeddings
+
+def get_vectorstore():
+    """Get or create vector store instance."""
+    global _vectorstore
+    if _vectorstore is None:
+        embeddings = get_embeddings()
+        
+        # Create ChromaDB client with persistent storage
+        client = chromadb.PersistentClient(
+            path="./chroma_db",
+            settings=Settings(anonymized_telemetry=False)
+        )
+        
+        _vectorstore = Chroma(
+            client=client,
+            collection_name="agent_knowledge",
+            embedding_function=embeddings,
+        )
+    return _vectorstore
 
 def get_llm():
-    
     """Get or create LLM instance - prefer Groq if available, fallback to Gemini."""
     print("Getting LLM")
     global _llm
@@ -39,9 +75,66 @@ def get_llm():
             )
     return _llm
 
+def add_to_vectorstore(content: str, source: str, metadata: dict = {}):
+    """Add content to the vector store."""
+    try:
+        vectorstore = get_vectorstore()
+        # Split text into chunks
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500,
+            chunk_overlap=50,
+            length_function=len,
+        )
+        
+        chunks = text_splitter.split_text(content)
+        
+        # Create documents
+        documents = []
+        for i, chunk in enumerate(chunks):
+            doc_metadata = {
+                "source": source,
+                "chunk_id": i,
+                **(metadata or {})
+            }
+            documents.append(Document(page_content=chunk, metadata=doc_metadata))
+        
+        # Add to vector store
+        vectorstore.add_documents(documents)
+        print(f"Added {len(documents)} chunks to vector store from {source}")
+        
+    except Exception as e:
+        print(f"Error adding to vector store: {e}")
+
+@tool
+def vector_search(query: str) -> str:
+    """Search the vector database for relevant stored information.
+    Args:
+        query: The query to search for in stored knowledge.
+    Returns:
+        A string containing relevant information from the vector database.
+    """
+    print("Vector search tool called")
+    try:
+        vectorstore = get_vectorstore()
+        results = vectorstore.similarity_search(query, k=3)
+        
+        if not results:
+            return "No relevant information found in stored knowledge."
+        
+        # Format results
+        formatted_results = []
+        for i, doc in enumerate(results, 1):
+            source = doc.metadata.get('source', 'Unknown')
+            content = doc.page_content[:400]  # Limit content
+            formatted_results.append(f"{i}. Source: {source}\nContent: {content}")
+        
+        return f"Relevant stored information for '{query}':\n\n" + "\n\n".join(formatted_results)
+        
+    except Exception as e:
+        return f"Vector search error: {e}"
+
 @tool
 def web_search(query: str) -> str:
-    
     """Search the web for current information, news, and general queries.
     Args:
         query: The query to search the web for.
@@ -62,6 +155,13 @@ def web_search(query: str) -> str:
             title = doc.get('title', 'No title')
             url = doc.get('url', '')
             results.append(f"{i}. {title}\nURL: {url}\nContent: {content}")
+            
+            # Add to vector store for future reference
+            add_to_vectorstore(
+                content=content,
+                source=f"web_search_{url}",
+                metadata={"title": title, "url": url, "query": query}
+            )
         
         return f"Search results for '{query}':\n\n" + "\n\n".join(results)
         
@@ -70,7 +170,6 @@ def web_search(query: str) -> str:
 
 @tool
 def wikipedia_search(query: str) -> str:
-    
     """Search Wikipedia for encyclopedic information about people, places, events, etc.
     Args:
         query: The query to search Wikipedia for.
@@ -90,6 +189,13 @@ def wikipedia_search(query: str) -> str:
             title = doc.metadata.get('title', 'Unknown')
             content = doc.page_content[:800]  # Limit content
             results.append(f"Wikipedia Article: {title}\nContent: {content}")
+            
+            # Add to vector store for future reference
+            add_to_vectorstore(
+                content=doc.page_content,
+                source=f"wikipedia_{title}",
+                metadata={"title": title, "query": query}
+            )
         
         return f"Wikipedia results for '{query}':\n\n" + "\n\n---\n\n".join(results)
         
@@ -98,7 +204,6 @@ def wikipedia_search(query: str) -> str:
 
 @tool
 def calculator(expression: str) -> str:
-   
     """Perform mathematical calculations. Supports basic operations and math functions.
     Args:
         expression: The mathematical expression to evaluate.
@@ -122,7 +227,6 @@ def calculator(expression: str) -> str:
 
 @tool
 def arxiv_search(query: str) -> str:
-    
     """Search ArXiv for academic papers and research articles.
     Args:
         query: The query to search ArXiv for.
@@ -145,16 +249,21 @@ def arxiv_search(query: str) -> str:
         if not result or result.strip() == "":
             return f"No ArXiv papers found for: {query}"
         else:
+            # Add to vector store for future reference
+            add_to_vectorstore(
+                content=result,
+                source=f"arxiv_{query}",
+                metadata={"query": query}
+            )
             return f"ArXiv results for '{query}':\n\n{result}"
     
     except Exception as e:
         return f"ArXiv search error: {e}"
 
-# Define all tools
-tools = [web_search, wikipedia_search, calculator, arxiv_search]
+# Define all tools (vector_search is first to be checked before external searches)
+tools = [vector_search, web_search, wikipedia_search, calculator, arxiv_search]
 
 def model_node(state: AgentState) -> AgentState:
-    
     """Main model node that processes queries and calls tools when needed.
     Args:
         state: The current state of the agent.
@@ -170,15 +279,20 @@ def model_node(state: AgentState) -> AgentState:
     
     # Add system message if not present
     if not messages or not isinstance(messages[0], AIMessage):
-        system_message = AIMessage(content="""You are a helpful assistant tasked with answering questions using a set of tools.
+        system_message = AIMessage(content="""You are a helpful assistant with access to various tools and a knowledge base.
+
+Search Strategy:
+1. ALWAYS start with vector_search to check if relevant information is already stored
+2. If vector_search doesn't provide sufficient information, then use external tools
+3. Use web_search for current events, news, and recent information
+4. Use wikipedia_search for encyclopedic information
+5. Use arxiv_search for academic papers and research
+6. Use calculator for mathematical operations
 
 Your final answer must strictly follow this format:
 FINAL ANSWER: [ANSWER]
 
 Only write the answer in that exact format. Do not explain anything. Do not include any other text.
-
-
-Only use tools if the current question is different from the similar one.
 
 Examples:
 - FINAL ANSWER: FunkMonk
@@ -196,7 +310,6 @@ If you do not follow this format exactly, your response will be considered incor
         return {"messages": messages + [error_msg]}
 
 def should_continue(state: AgentState) -> str:
-    
     """Determine if we should continue with tool calls or end.
     Args:
         state: The current state of the agent.
@@ -215,7 +328,6 @@ def should_continue(state: AgentState) -> str:
     return "end"
 
 def build_graph():
-    
     """Build and compile the agent graph."""
     print("Building graph")
     # Create tool node
@@ -247,7 +359,6 @@ def build_graph():
     return builder.compile()
 
 def run_agent(query: str) -> str:
-
     """Run the agent with a query and return the final answer.
     Args:
         query: The query to run the agent with.
@@ -277,3 +388,77 @@ def run_agent(query: str) -> str:
         
     except Exception as e:
         return f"Error: {e}"
+
+
+def run_agent_with_history(query: str) -> tuple[str, List[Any]]:
+    """Run the agent and return both the answer and the full message history.
+    Args:
+        query: The query to run the agent with.
+    Returns:
+        A tuple containing the final answer and the full message history.
+    """
+    print("Running agent with history")
+    graph = build_graph()
+    
+    initial_state = {
+        "messages": [HumanMessage(content=query)]
+    }
+    
+    try:
+        final_state = graph.invoke(initial_state)
+        
+        # Extract the final answer
+        messages = final_state["messages"]
+        final_answer = "No answer generated"
+        
+        for message in reversed(messages):
+            if isinstance(message, AIMessage) and not (hasattr(message, 'tool_calls') and message.tool_calls):
+                final_answer = message.content
+                break
+        
+        return str(final_answer), messages
+        
+    except Exception as e:
+        return f"Error: {e}", []
+
+# Utility functions for vector store management
+def add_knowledge_from_file(file_path: str):
+    """Add knowledge from a text file to the vector store."""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as file:
+            content = file.read()
+        
+        add_to_vectorstore(
+            content=content,
+            source=f"file_{os.path.basename(file_path)}",
+            metadata={"file_path": file_path}
+        )
+        print(f"Successfully added knowledge from {file_path}")
+        
+    except Exception as e:
+        print(f"Error adding knowledge from file: {e}")
+
+def clear_vectorstore():
+    """Clear all data from the vector store."""
+    try:
+        vectorstore = get_vectorstore()
+        vectorstore.delete_collection()
+        print("Vector store cleared successfully")
+        
+        # Reset global variable to force recreation
+        global _vectorstore
+        _vectorstore = None
+        
+    except Exception as e:
+        print(f"Error clearing vector store: {e}")
+
+def get_vectorstore_stats():
+    """Get statistics about the vector store."""
+    try:
+        vectorstore = get_vectorstore()
+        collection = vectorstore._collection
+        count = collection.count()
+        return f"Vector store contains {count} documents"
+        
+    except Exception as e:
+        return f"Error getting vector store stats: {e}"
